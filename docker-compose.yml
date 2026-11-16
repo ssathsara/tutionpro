@@ -1,0 +1,87 @@
+# Production-style stack: MySQL + Redis + Laravel (php-fpm, queue worker, scheduler) + nginx serving the Vue build.
+# Usage:  cp backend/.env.example backend/.env  (set APP_KEY etc.), then
+#         docker compose up -d --build
+#         docker compose exec api php artisan migrate --force
+# Scale background work with:  docker compose up -d --scale queue=3
+
+x-app-env: &app-env
+  DB_HOST: db
+  DB_DATABASE: tuitionpro
+  DB_USERNAME: tuitionpro
+  DB_PASSWORD: ${DB_PASSWORD:-change-me}
+  APP_ENV: production
+  APP_DEBUG: "false"
+  # Redis for cache (reports, rate limits) and the job queue (SMS, invoice generation)
+  REDIS_HOST: redis
+  CACHE_STORE: redis
+  QUEUE_CONNECTION: redis
+  SESSION_DRIVER: redis
+
+services:
+  db:
+    image: mysql:8.0
+    restart: unless-stopped
+    command: ["--innodb-buffer-pool-size=1G", "--max-connections=300"]
+    environment:
+      MYSQL_DATABASE: tuitionpro
+      MYSQL_USER: tuitionpro
+      MYSQL_PASSWORD: ${DB_PASSWORD:-change-me}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-change-me-too}
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis-data:/data
+
+  api:
+    build: ./backend
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment: *app-env
+    volumes:
+      - storage:/var/www/html/storage/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  # Background jobs: SMS sending (with retries) and monthly invoice generation.
+  queue:
+    build: ./backend
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment: *app-env
+    command: ["php", "artisan", "queue:work", "--sleep=1", "--tries=3", "--max-time=3600", "--timeout=900"]
+    volumes:
+      - storage:/var/www/html/storage/app
+    depends_on: [api]
+
+  # Laravel scheduler: sends scheduled announcements every minute.
+  scheduler:
+    build: ./backend
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment: *app-env
+    command: ["php", "artisan", "schedule:work"]
+    depends_on: [api]
+
+  web:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    depends_on: [api]
+
+volumes:
+  db-data:
+  redis-data:
+  storage:
